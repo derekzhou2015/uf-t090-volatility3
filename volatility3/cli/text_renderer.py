@@ -99,12 +99,46 @@ def optional(
     return wrapped
 
 
-def quoted_optional(func: Callable) -> Callable:
+def csv_optional(
+    func: Callable[[Union[interfaces.renderers.BaseAbsentValue, T]], str],
+) -> Callable[[T], str]:
+    """Renders values for machine-readable CSV output.
+
+    Every absent value (unreadable, unparsable, not applicable, not
+    available) becomes the same single representation: an empty field.
+    """
+
     @wraps(func)
     def wrapped(x: Any) -> str:
-        result = optional(func)(x)
-        if result == "-" or result == "N/A":
+        if isinstance(x, interfaces.renderers.BaseAbsentValue):
             return ""
+        return func(x)
+
+    return wrapped
+
+
+def json_optional(func: Callable) -> Callable:
+    """Renders values for machine-readable JSON output.
+
+    Every absent value becomes None (JSON null), so missing data has
+    exactly one representation that cannot be confused with a string.
+    """
+
+    @wraps(func)
+    def wrapped(x: Any) -> Any:
+        if isinstance(x, interfaces.renderers.BaseAbsentValue):
+            return None
+        return func(x)
+
+    return wrapped
+
+
+def quoted_optional(func: Callable) -> Callable:
+    @wraps(func)
+    def wrapped(x: Any) -> Optional[str]:
+        if isinstance(x, interfaces.renderers.BaseAbsentValue):
+            return None
+        result = func(x)
         if isinstance(x, format_hints.MultiTypeData) and x.converted_int:
             return f"{result}"
         if isinstance(x, int) and not isinstance(
@@ -306,14 +340,19 @@ class QuickTextRenderer(CLIRenderer):
 
         def visitor(node: interfaces.renderers.TreeNode, accumulator):
             line = []
+            # The filter sees every column, so its column indexes always
+            # align with the grid's columns even when some are hidden
+            filter_line = []
             for column_index, column in enumerate(grid.columns):
                 renderer = self._type_renderers.get(
                     column.type, self._type_renderers["default"]
                 )
+                rendered = renderer(node.values[column_index])
+                filter_line.append(rendered)
                 if column not in ignore_columns:
-                    line.append(renderer(node.values[column_index]))
+                    line.append(rendered)
 
-            if self.filter and self.filter.filter(line):
+            if self.filter and self.filter.filter(filter_line):
                 return accumulator
 
             accumulator.write("\n")
@@ -351,6 +390,22 @@ class CSVRenderer(CLIRenderer):
     name = "csv"
     structured_output = True
 
+    # Machine-readable contract, kept separate from the human-oriented
+    # CLIRenderer table:
+    #   * every absent value is one empty field (never "N/A" or "-")
+    #   * datetimes are ISO 8601 (identical to the JSON renderers)
+    _type_renderers = {
+        format_hints.Bin: csv_optional(lambda x: f"0b{x:b}"),
+        format_hints.Hex: csv_optional(lambda x: f"0x{x:x}"),
+        format_hints.HexBytes: csv_optional(hex_bytes_as_text),
+        format_hints.MultiTypeData: csv_optional(multitypedata_as_text),
+        renderers.Disassembly: csv_optional(display_disassembly),
+        bytes: csv_optional(lambda x: " ".join(f"{b:02x}" for b in x)),
+        renderers.LayerData: LayerDataRenderer(),
+        datetime.datetime: csv_optional(lambda x: x.isoformat()),
+        "default": csv_optional(lambda x: f"{x}"),
+    }
+
     def get_render_options(self):
         return []
 
@@ -377,16 +432,17 @@ class CSVRenderer(CLIRenderer):
         def visitor(node: interfaces.renderers.TreeNode, accumulator):
             # Nodes always have a path value, giving them a path_depth of at least 1, we use max just in case
             row = {"TreeDepth": str(max(0, node.path_depth - 1))}
+            # The filter sees every column, so its column indexes always
+            # align with the grid's columns even when some are hidden
             line = []
             for column_index, column in enumerate(grid.columns):
                 renderer = self._type_renderers.get(
                     column.type, self._type_renderers["default"]
                 )
-                row[f"{column.name}"] = renderer(node.values[column_index])
+                rendered = renderer(node.values[column_index])
+                line.append(rendered)
                 if column not in ignore_columns:
-                    line.append(row[f"{column.name}"])
-                else:
-                    del row[f"{column.name}"]
+                    row[f"{column.name}"] = rendered
 
             if self.filter and self.filter.filter(line):
                 return accumulator
@@ -533,25 +589,23 @@ class PrettyTextRenderer(CLIRenderer):
 
 
 class JsonRenderer(CLIRenderer):
+    # Machine-readable contract: every absent value is JSON null, never a
+    # placeholder string such as "N/A" or "".
     _type_renderers = {
         format_hints.HexBytes: lambda x: (
             x.hex(" ")
             if not isinstance(x, interfaces.renderers.BaseAbsentValue)
-            else "N/A"
+            else None
         ),
         renderers.Disassembly: quoted_optional(display_disassembly),
         format_hints.MultiTypeData: quoted_optional(multitypedata_as_text),
         renderers.LayerData: lambda x: (
             LayerDataRenderer().render_bytes(x)[0].hex(" ")
             if not isinstance(x, interfaces.renderers.BaseAbsentValue)
-            else "N/A"
-        ),
-        bytes: optional(lambda x: " ".join(f"{b:02x}" for b in x)),
-        datetime.datetime: lambda x: (
-            x.isoformat()
-            if not isinstance(x, interfaces.renderers.BaseAbsentValue)
             else None
         ),
+        bytes: json_optional(lambda x: " ".join(f"{b:02x}" for b in x)),
+        datetime.datetime: json_optional(lambda x: x.isoformat()),
         "default": lambda x: x,
     }
 
@@ -583,18 +637,20 @@ class JsonRenderer(CLIRenderer):
             # Nodes always have a path value, giving them a path_depth of at least 1, we use max just in case
             acc_map, final_tree = accumulator
             node_dict: Dict[str, Any] = {"__children": []}
+            # The filter sees every column, so its column indexes always
+            # align with the grid's columns even when some are hidden
             line = []
             for column_index, column in enumerate(grid.columns):
-                if column in ignore_columns:
-                    continue
                 renderer = self._type_renderers.get(
                     column.type, self._type_renderers["default"]
                 )
                 data = renderer(list(node.values)[column_index])
                 if isinstance(data, interfaces.renderers.BaseAbsentValue):
                     data = None
-                node_dict[column.name] = data
                 line.append(data)
+                if column in ignore_columns:
+                    continue
+                node_dict[column.name] = data
 
             if self.filter and self.filter.filter(line):
                 return accumulator

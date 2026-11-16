@@ -236,7 +236,9 @@ class CommandLine:
         )
         parser.add_argument(
             "--filters",
-            help="List of filters to apply to the output (in the form of [+-]columname,pattern[!])",
+            help="List of filters to apply to the output (in the form of [+-][columnname,]pattern[!]; "
+            "a column name must match exactly one column, a trailing ! marks a regular expression, "
+            "an empty leading column name matches the pattern against every column)",
             default=[],
             action="append",
         )
